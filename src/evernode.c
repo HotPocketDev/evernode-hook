@@ -171,6 +171,7 @@ int64_t hook(uint32_t reserved)
                     SET_UINT_STATE_VALUE(zero, STK_MOMENT_BASE_IDX, "Evernode: Could not initialize state for moment base index.");
                     SET_UINT_STATE_VALUE(DEF_HOST_REG_FEE, STK_HOST_REG_FEE, "Evernode: Could not initialize state for reg fee.");
                     SET_UINT_STATE_VALUE(DEF_MAX_REG, STK_MAX_REG, "Evernode: Could not initialize state for maximum registrants.");
+                    SET_UINT_STATE_VALUE(DEF_MAX_TOLERABLE_DOWNTIME, STK_MAX_TOLERABLE_DOWNTIME, "Evernode: Could not initialize maximum tolerable downtime.");
 
                     if (state_set(issuer_ptr, ACCOUNT_ID_SIZE, SBUF(CONF_ISSUER_ADDR)) < 0)
                         rollback(SBUF("Evernode: Could not set state for issuer account."), 1);
@@ -426,6 +427,134 @@ int64_t hook(uint32_t reserved)
 
                     accept(SBUF("Evernode: Update host info successful."), 0);
                 }
+
+                // Dead Host Prune.
+                int is_dead_host_prune = 0;
+                BUFFER_EQUAL_STR(is_dead_host_prune, type_ptr, type_len, DEAD_HOST_PRUNE);
+                if (is_dead_host_prune)
+                {
+                    int is_format_text = 0;
+                    BUFFER_EQUAL_STR(is_format_text, format_ptr, format_len, FORMAT_TEXT);
+                    if (!is_format_text)
+                        rollback(SBUF("Evernode: Format should be text to prune the host."), 1);
+
+                    uint8_t host_account_id[ACCOUNT_ID_SIZE];
+
+                    util_accid(SBUF(host_account_id), data_ptr, data_len);
+
+                    HOST_ADDR_KEY(host_account_id); // Generate host account key.
+                    // Check for registration entry.
+                    uint8_t reg_entry_buf[HOST_ADDR_VAL_SIZE];
+                    if (state(SBUF(reg_entry_buf), SBUF(STP_HOST_ADDR)) == DOESNT_EXIST)
+                        rollback(SBUF("Evernode: This host is not registered."), 1);
+
+                    uint64_t last_heartbeat = UINT64_FROM_BUF(reg_entry_buf + HOST_HEARTBEAT_LEDGER_IDX_OFFSET);
+                    uint64_t heartbeat_delay = (cur_ledger_seq - last_heartbeat) / DEF_MOMENT_SIZE;
+
+                    // Take the maximun tolerable downtime from config.
+                    uint64_t max_tolerable_downtime;
+                    GET_CONF_VALUE(max_tolerable_downtime, STK_MAX_TOLERABLE_DOWNTIME, "Evernode: Could not get the maximum tolerable downtime from the state.");
+
+                    if (heartbeat_delay < max_tolerable_downtime)
+                        rollback(SBUF("Evernode: This host is not eligible for forceful removal based on inactiveness."), 1);
+
+                    TOKEN_ID_KEY((uint8_t *)(reg_entry_buf + HOST_TOKEN_ID_OFFSET)); // Generate token id key.
+
+                    // Check the ownership of the NFT to this user before proceeding.
+                    int nft_exists;
+                    uint8_t issuer[20], uri[64], uri_len;
+                    uint32_t taxon, nft_seq;
+                    uint16_t flags, tffee;
+                    uint8_t *token_id_ptr = &reg_entry_buf[HOST_TOKEN_ID_OFFSET];
+                    GET_NFT(host_account_id, token_id_ptr, nft_exists, issuer, uri, uri_len, taxon, flags, tffee, nft_seq);
+                    if (!nft_exists)
+                        rollback(SBUF("Evernode: Token mismatch with registration."), 1);
+
+                    // Issuer of the NFT should be the registry contract.
+                    BUFFER_EQUAL(nft_exists, issuer, hook_accid, ACCOUNT_ID_SIZE);
+                    if (!nft_exists)
+                        rollback(SBUF("Evernode: NFT Issuer mismatch with registration."), 1);
+
+                    // Check whether the NFT URI is starting with 'evrhost'.
+                    BUFFER_EQUAL_STR(nft_exists, uri, 7, EVR_HOST);
+                    if (!nft_exists)
+                        rollback(SBUF("Evernode: NFT URI is mismatch with registration."), 1);
+
+                    // Reserve for 2 transaction emissions.
+                    etxn_reserve(2);
+
+                    // Burn Registration NFT.
+                    uint8_t txn_out[PREPARE_NFT_BURN_SIZE];
+                    PREPARE_NFT_BURN(txn_out, token_id_ptr, host_account_id);
+
+                    uint8_t emithash[HASH_SIZE];
+                    if (emit(SBUF(emithash), SBUF(txn_out)) < 0)
+                        rollback(SBUF("Evernode: Emitting NFT burn txn failed"), 1);
+                    trace(SBUF("emit hash: "), SBUF(emithash), 1);
+
+                    // Delete registration entries.
+                    if (state_set(0, 0, SBUF(STP_TOKEN_ID)) < 0 || state_set(0, 0, SBUF(STP_HOST_ADDR)) < 0)
+                        rollback(SBUF("Evernode: Could not delete host registration entry."), 1);
+
+                    // Reduce host count by 1.
+                    uint64_t host_count;
+                    GET_HOST_COUNT(host_count);
+                    host_count -= 1;
+                    SET_HOST_COUNT(host_count);
+
+                    uint64_t reg_fee = UINT64_FROM_BUF(reg_entry_buf + HOST_REG_FEE_OFFSET);
+                    uint64_t fixed_reg_fee;
+                    GET_CONF_VALUE(fixed_reg_fee, CONF_FIXED_REG_FEE, "Evernode: Could not get fixed reg fee.");
+
+                    uint8_t issuer_accid[20];
+                    if (state(SBUF(issuer_accid), SBUF(CONF_ISSUER_ADDR)) < 0)
+                        rollback(SBUF("Evernode: Could not get issuer account id."), 1);
+
+                    // Sending 50% reg fee to Host account and to the epoch Reward pool.
+                    int64_t amount_half = reg_fee > fixed_reg_fee ? reg_fee / 2 : 0;
+
+                    if (reg_fee > fixed_reg_fee)
+                    {
+                        uint8_t amt_out_return[AMOUNT_BUF_SIZE];
+                        SET_AMOUNT_OUT(amt_out_return, EVR_TOKEN, issuer_accid, float_set(0, amount_half));
+                        etxn_reserve(2);
+
+                        // Prepare transaction to send 50% of reg fee to host account.
+                        uint8_t tx_buf[PREPARE_PAYMENT_PRUNED_HOST_REBATE_SIZE];
+                        PREPARE_PAYMENT_PRUNED_HOST_REBATE(tx_buf, amt_out_return, 0, host_account_id);
+
+                        if (emit(SBUF(emithash), SBUF(tx_buf)) < 0)
+                            rollback(SBUF("Evernode: Rebating 1/2 reg fee to host account failed."), 1);
+
+                        // BEGIN: Update the epoch Reward pool.
+
+                        // Take the moment base idx from config.
+                        uint64_t moment_base_idx;
+                        GET_CONF_VALUE(moment_base_idx, STK_MOMENT_BASE_IDX, "Evernode: Could not get moment base index.");
+                        TRACEVAR(moment_base_idx);
+
+                        // Take the moment size from config.
+                        uint16_t moment_size;
+                        GET_CONF_VALUE(moment_size, CONF_MOMENT_SIZE, "Evernode: Could not get moment size.");
+                        TRACEVAR(moment_size);
+
+                        // <epoch(uint8_t)><saved_moment(uint32_t)><prev_moment_active_host_count(uint32_t)><cur_moment_active_host_count(uint32_t)><epoch_pool(int64_t,xfl)>
+                        uint8_t reward_info[REWARD_INFO_VAL_SIZE];
+                        if (state(reward_info, REWARD_INFO_VAL_SIZE, SBUF(STK_REWARD_INFO)) < 0)
+                            rollback(SBUF("Evernode: Could not get reward info state."), 1);
+
+                        int64_t reward_pool_amount, reward_quota;
+                        PREPARE_EPOCH_REWARD_INFO(reward_info, moment_base_idx, moment_size, 0, reward_pool_amount, reward_quota);
+                        INT64_TO_BUF(&reward_info[EPOCH_POOL_OFFSET], float_sum(reward_pool_amount, float_set(0, amount_half - 5)));
+
+                        if (state_set(reward_info, REWARD_INFO_VAL_SIZE, SBUF(STK_REWARD_INFO)) < 0)
+                            rollback(SBUF("Evernode: Could not set state for reward info."), 1);
+
+                        // END: Update the epoch Reward pool.
+                    }
+
+                    accept(SBUF("Evernode: Dead Host Pruning successful."), 0);
+                }
             }
             else
             {
@@ -508,7 +637,7 @@ int64_t hook(uint32_t reserved)
                     TRACEVAR(token_seq);
 
                     // Flag, Transfer fee and Taxon will be 0 for the minted NFT.
-                    uint16_t tflag = 0;
+                    uint16_t tflag = tfBurnable; // Bitwise OR helps to add multiple flags.
                     uint32_t taxon = 0;
                     uint16_t tffee = 0;
 
