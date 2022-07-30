@@ -8,6 +8,7 @@
 #define INITIALIZE "evnInitialize"
 #define FOUNDATION_REFUND_50 "evnFoundationRefund"
 #define HOST_POST_DEREG "evnHostPostDereg"
+#define HOST_REWARD "evnHostReward"
 
 #define FORMAT_HEX "hex"
 #define FORMAT_BASE64 "base64"
@@ -38,7 +39,7 @@
 
 // Default values.
 const uint8_t HOOK_INITIALIZER_ADDR[35] = "rMv668j9M6x2ww4HNEF4AhB8ju77oSxFJD";
-const uint16_t DEF_MOMENT_SIZE = 900;
+const uint16_t DEF_MOMENT_SIZE = 1190;
 const uint64_t DEF_MINT_LIMIT = 72253440;
 const uint64_t DEF_HOST_REG_FEE = 5120;
 const uint64_t DEF_FIXED_REG_FEE = 5;
@@ -58,8 +59,19 @@ const uint32_t COUNTRY_CODE_LEN = 2;
 const uint32_t DESCRIPTION_LEN = 26;
 const uint32_t CPU_MODEl_NAME_LEN = 40;
 const uint32_t ACCOUNT_ID_SIZE = 20;
+const uint32_t REWARD_INFO_VAL_SIZE = 21;
+const uint32_t EPOCH_COUNT = 10;
+const uint32_t FIRST_EPOCH_REWARD_QUOTA = 5120;
+const uint32_t EPOCH_REWARD_AMOUNT = 5160960;
 
 // State value offsets
+// REWARD_INFO
+const uint32_t EPOCH_OFFSET = 0;
+const uint32_t SAVED_MOMENT_OFFSET = 1;
+const uint32_t PREV_MOMENT_ACTIVE_HOST_COUNT_OFFSET = 5;
+const uint32_t CUR_MOMENT_ACTIVE_HOST_COUNT_OFFSET = 9;
+const uint32_t EPOCH_POOL_OFFSET = 13;
+
 // HOST_ADDR
 const uint32_t HOST_TOKEN_ID_OFFSET = 0;
 const uint32_t HOST_COUNTRY_CODE_OFFSET = 32;
